@@ -6,6 +6,7 @@
 (define-constant ERR-QUORUM-NOT-MET (err u105))
 (define-constant ERR-PROPOSAL-NOT-FOUND (err u106))
 (define-constant ERR-PROPOSAL-NOT-ACTIVE (err u107))
+(define-constant ERR-CANNOT-DELEGATE-TO-SELF (err u108))
 
 (define-data-var proposal-count uint u0)
 (define-data-var min-proposal-duration uint u144)
@@ -35,6 +36,11 @@
 (define-map member-weights
     principal
     uint
+)
+
+(define-map delegations
+    principal
+    principal
 )
 
 (define-public (initialize-dao (token principal))
@@ -67,10 +73,13 @@
         (var-set proposal-count proposal-id)
         (ok proposal-id)))
 
+(define-read-only (get-total-voting-power (member principal))
+    (+ (default-to u0 (map-get? member-weights member)) u0))
+
 (define-public (cast-vote (proposal-id uint) (vote bool))
     (let
         ((proposal (unwrap! (map-get? proposals proposal-id) ERR-PROPOSAL-NOT-FOUND))
-         (voter-weight (default-to u0 (map-get? member-weights tx-sender))))
+         (voter-weight (get-total-voting-power tx-sender)))
         (asserts! (is-eq (get status proposal) "active") ERR-PROPOSAL-NOT-ACTIVE)
         (asserts! (>= stacks-block-height (get start-height proposal)) ERR-INVALID-PROPOSAL)
         (asserts! (<= stacks-block-height (get end-height proposal)) ERR-PROPOSAL-EXPIRED)
@@ -103,6 +112,17 @@
         (map-set member-weights member weight)
         (ok true)))
 
+(define-public (delegate-to (delegate principal))
+    (begin
+        (asserts! (not (is-eq tx-sender delegate)) ERR-CANNOT-DELEGATE-TO-SELF)
+        (map-set delegations tx-sender delegate)
+        (ok true)))
+
+(define-public (undelegate)
+    (begin
+        (map-delete delegations tx-sender)
+        (ok true)))
+
 (define-read-only (get-proposal (proposal-id uint))
     (map-get? proposals proposal-id))
 
@@ -123,3 +143,11 @@
             (<= stacks-block-height (get end-height proposal))
             (is-none (map-get? votes {proposal-id: proposal-id, voter: voter}))))
         ERR-PROPOSAL-NOT-FOUND))
+
+(define-read-only (get-delegate (member principal))
+    (map-get? delegations member))
+
+(define-read-only (get-delegation-status (member principal))
+    (match (map-get? delegations member)
+        delegate (some delegate)
+        none))
