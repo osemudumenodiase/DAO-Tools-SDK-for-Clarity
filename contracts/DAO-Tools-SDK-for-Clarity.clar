@@ -7,8 +7,12 @@
 (define-constant ERR-PROPOSAL-NOT-FOUND (err u106))
 (define-constant ERR-PROPOSAL-NOT-ACTIVE (err u107))
 (define-constant ERR-CANNOT-DELEGATE-TO-SELF (err u108))
+(define-constant ERR-AMENDMENT-NOT-FOUND (err u109))
+(define-constant ERR-AMENDMENT-EXPIRED (err u110))
+(define-constant ERR-CANNOT-AMEND-FINALIZED (err u111))
 
 (define-data-var proposal-count uint u0)
+(define-data-var amendment-count uint u0)
 (define-data-var min-proposal-duration uint u144)
 (define-data-var quorum-threshold uint u500)
 (define-data-var voting-token (optional principal) none)
@@ -41,6 +45,25 @@
 (define-map delegations
     principal
     principal
+)
+
+(define-map amendments
+    uint
+    {
+        proposal-id: uint,
+        creator: principal,
+        new-title: (string-ascii 50),
+        new-description: (string-ascii 500),
+        submission-height: uint,
+        yes-votes: uint,
+        no-votes: uint,
+        status: (string-ascii 20)
+    }
+)
+
+(define-map amendment-votes
+    { amendment-id: uint, voter: principal }
+    { vote: bool }
 )
 
 (define-public (initialize-dao (token principal))
@@ -151,3 +174,71 @@
     (match (map-get? delegations member)
         delegate (some delegate)
         none))
+
+(define-public (submit-amendment 
+    (proposal-id uint)
+    (new-title (string-ascii 50))
+    (new-description (string-ascii 500)))
+    (let
+        ((proposal (unwrap! (map-get? proposals proposal-id) ERR-PROPOSAL-NOT-FOUND))
+         (amendment-id (+ (var-get amendment-count) u1)))
+        (asserts! (is-eq (get status proposal) "active") ERR-CANNOT-AMEND-FINALIZED)
+        (asserts! (<= stacks-block-height (get end-height proposal)) ERR-AMENDMENT-EXPIRED)
+        (map-set amendments amendment-id
+            {
+                proposal-id: proposal-id,
+                creator: tx-sender,
+                new-title: new-title,
+                new-description: new-description,
+                submission-height: stacks-block-height,
+                yes-votes: u0,
+                no-votes: u0,
+                status: "pending"
+            })
+        (var-set amendment-count amendment-id)
+        (ok amendment-id)))
+
+(define-public (vote-on-amendment (amendment-id uint) (vote bool))
+    (let
+        ((amendment (unwrap! (map-get? amendments amendment-id) ERR-AMENDMENT-NOT-FOUND))
+         (proposal (unwrap! (map-get? proposals (get proposal-id amendment)) ERR-PROPOSAL-NOT-FOUND))
+         (voter-weight (get-total-voting-power tx-sender)))
+        (asserts! (is-eq (get status amendment) "pending") ERR-PROPOSAL-NOT-ACTIVE)
+        (asserts! (is-eq (get status proposal) "active") ERR-CANNOT-AMEND-FINALIZED)
+        (asserts! (<= stacks-block-height (get end-height proposal)) ERR-AMENDMENT-EXPIRED)
+        (asserts! (is-none (map-get? amendment-votes {amendment-id: amendment-id, voter: tx-sender})) ERR-ALREADY-VOTED)
+        (map-set amendment-votes {amendment-id: amendment-id, voter: tx-sender} {vote: vote})
+        (if vote
+            (map-set amendments amendment-id 
+                (merge amendment {yes-votes: (+ (get yes-votes amendment) voter-weight)}))
+            (map-set amendments amendment-id 
+                (merge amendment {no-votes: (+ (get no-votes amendment) voter-weight)})))
+        (ok true)))
+
+(define-public (apply-amendment (amendment-id uint))
+    (let
+        ((amendment (unwrap! (map-get? amendments amendment-id) ERR-AMENDMENT-NOT-FOUND))
+         (proposal (unwrap! (map-get? proposals (get proposal-id amendment)) ERR-PROPOSAL-NOT-FOUND))
+         (total-amendment-votes (+ (get yes-votes amendment) (get no-votes amendment))))
+        (asserts! (is-eq (get status amendment) "pending") ERR-PROPOSAL-NOT-ACTIVE)
+        (asserts! (is-eq (get status proposal) "active") ERR-CANNOT-AMEND-FINALIZED)
+        (asserts! (>= total-amendment-votes (/ (var-get quorum-threshold) u2)) ERR-QUORUM-NOT-MET)
+        (asserts! (> (get yes-votes amendment) (get no-votes amendment)) ERR-INVALID-PROPOSAL)
+        (map-set proposals (get proposal-id amendment)
+            (merge proposal
+                {
+                    title: (get new-title amendment),
+                    description: (get new-description amendment)
+                }))
+        (map-set amendments amendment-id
+            (merge amendment {status: "applied"}))
+        (ok true)))
+
+(define-read-only (get-amendment (amendment-id uint))
+    (map-get? amendments amendment-id))
+
+(define-read-only (get-amendment-vote (amendment-id uint) (voter principal))
+    (map-get? amendment-votes {amendment-id: amendment-id, voter: voter}))
+
+(define-read-only (get-total-amendments)
+    (var-get amendment-count))
