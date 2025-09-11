@@ -10,12 +10,20 @@
 (define-constant ERR-AMENDMENT-NOT-FOUND (err u109))
 (define-constant ERR-AMENDMENT-EXPIRED (err u110))
 (define-constant ERR-CANNOT-AMEND-FINALIZED (err u111))
+(define-constant ERR-TREASURY-INSUFFICIENT-BALANCE (err u112))
+(define-constant ERR-TIMELOCK-NOT-EXPIRED (err u113))
+(define-constant ERR-WITHDRAWAL-NOT-FOUND (err u114))
+(define-constant ERR-WITHDRAWAL-ALREADY-EXECUTED (err u115))
+(define-constant ERR-TREASURY-PAUSED (err u116))
 
 (define-data-var proposal-count uint u0)
 (define-data-var amendment-count uint u0)
 (define-data-var min-proposal-duration uint u144)
 (define-data-var quorum-threshold uint u500)
 (define-data-var voting-token (optional principal) none)
+(define-data-var withdrawal-count uint u0)
+(define-data-var timelock-duration uint u1008)
+(define-data-var treasury-paused bool false)
 
 (define-map proposals
     uint 
@@ -63,8 +71,18 @@
 
 (define-map amendment-votes
     { amendment-id: uint, voter: principal }
-    { vote: bool }
-)
+    { vote: bool })
+
+(define-map treasury-withdrawals
+    uint
+    {
+        recipient: principal,
+        amount: uint,
+        created-height: uint,
+        execution-height: uint,
+        executed: bool,
+        creator: principal
+    })
 
 (define-public (initialize-dao (token principal))
     (begin
@@ -242,3 +260,68 @@
 
 (define-read-only (get-total-amendments)
     (var-get amendment-count))
+
+
+(define-public (propose-treasury-withdrawal (recipient principal) (amount uint))
+    (let
+        ((withdrawal-id (+ (var-get withdrawal-count) u1))
+         (execution-height (+ stacks-block-height (var-get timelock-duration))))
+        (asserts! (not (var-get treasury-paused)) ERR-TREASURY-PAUSED)
+(asserts! (<= amount (as-contract (stx-get-balance tx-sender))) ERR-TREASURY-INSUFFICIENT-BALANCE)
+        (asserts! (> (get-total-voting-power tx-sender) u0) ERR-NOT-AUTHORIZED)
+        (map-set treasury-withdrawals withdrawal-id
+            {
+                recipient: recipient,
+                amount: amount,
+                created-height: stacks-block-height,
+                execution-height: execution-height,
+                executed: false,
+                creator: tx-sender
+            })
+        (var-set withdrawal-count withdrawal-id)
+        (ok withdrawal-id)))
+
+(define-public (execute-treasury-withdrawal (withdrawal-id uint))
+    (let
+        ((withdrawal (unwrap! (map-get? treasury-withdrawals withdrawal-id) ERR-WITHDRAWAL-NOT-FOUND)))
+        (asserts! (not (var-get treasury-paused)) ERR-TREASURY-PAUSED)
+        (asserts! (not (get executed withdrawal)) ERR-WITHDRAWAL-ALREADY-EXECUTED)
+        (asserts! (>= stacks-block-height (get execution-height withdrawal)) ERR-TIMELOCK-NOT-EXPIRED)
+(asserts! (<= (get amount withdrawal) (as-contract (stx-get-balance tx-sender))) ERR-TREASURY-INSUFFICIENT-BALANCE)
+        (try! (as-contract (stx-transfer? (get amount withdrawal) tx-sender (get recipient withdrawal))))
+        (map-set treasury-withdrawals withdrawal-id
+            (merge withdrawal {executed: true}))
+        (ok true)))
+
+(define-public (set-timelock-duration (new-duration uint))
+    (begin
+        (asserts! (is-eq tx-sender contract-caller) ERR-NOT-AUTHORIZED)
+        (var-set timelock-duration new-duration)
+        (ok true)))
+
+(define-public (pause-treasury)
+    (begin
+        (asserts! (is-eq tx-sender contract-caller) ERR-NOT-AUTHORIZED)
+        (var-set treasury-paused true)
+        (ok true)))
+
+(define-public (unpause-treasury)
+    (begin
+        (asserts! (is-eq tx-sender contract-caller) ERR-NOT-AUTHORIZED)
+        (var-set treasury-paused false)
+        (ok true)))
+
+(define-read-only (get-treasury-balance)
+    (as-contract (stx-get-balance tx-sender)))
+
+(define-read-only (get-treasury-withdrawal (withdrawal-id uint))
+    (map-get? treasury-withdrawals withdrawal-id))
+
+(define-read-only (get-timelock-duration)
+    (var-get timelock-duration))
+
+(define-read-only (is-treasury-paused)
+    (var-get treasury-paused))
+
+(define-read-only (get-total-withdrawals)
+    (var-get withdrawal-count))
