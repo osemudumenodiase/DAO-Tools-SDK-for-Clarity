@@ -325,3 +325,271 @@
 
 (define-read-only (get-total-withdrawals)
     (var-get withdrawal-count))
+
+;; Governance Metrics and Analytics Functions
+(define-read-only (get-governance-stats)
+    (let
+        (
+            (total-props (var-get proposal-count))
+            (total-amends (var-get amendment-count))
+            (total-withdrawals (var-get withdrawal-count))
+        )
+        (ok {
+            total-proposals: total-props,
+            total-amendments: total-amends,
+            total-treasury-withdrawals: total-withdrawals,
+            current-quorum-threshold: (var-get quorum-threshold),
+            min-proposal-duration: (var-get min-proposal-duration),
+            timelock-duration: (var-get timelock-duration),
+            treasury-balance: (as-contract (stx-get-balance tx-sender)),
+            treasury-paused: (var-get treasury-paused)
+        })
+    )
+)
+
+(define-read-only (get-proposal-success-rate)
+    (let
+        (
+            (total-props (var-get proposal-count))
+            (passed-count (fold count-passed-proposals (list u1 u2 u3 u4 u5 u6 u7 u8 u9 u10) u0))
+        )
+        (if (> total-props u0)
+            (ok (/ (* passed-count u100) total-props))
+            (ok u0)
+        )
+    )
+)
+
+(define-private (count-passed-proposals (proposal-id uint) (acc uint))
+    (match (map-get? proposals proposal-id)
+        proposal (if (is-eq (get status proposal) "passed")
+            (+ acc u1)
+            acc
+        )
+        acc
+    )
+)
+
+(define-read-only (get-member-voting-stats (member principal))
+    (let
+        (
+            (member-weight (get-member-weight member))
+            (voting-power (get-total-voting-power member))
+        )
+        (ok {
+            member: member,
+            voting-weight: member-weight,
+            total-voting-power: voting-power,
+            has-delegation: (is-some (get-delegate member)),
+            delegate: (get-delegate member)
+        })
+    )
+)
+
+(define-read-only (get-proposal-participation-rate (proposal-id uint))
+    (match (map-get? proposals proposal-id)
+        proposal (let
+            (
+                (total-votes (+ (get yes-votes proposal) (get no-votes proposal)))
+                (quorum (var-get quorum-threshold))
+            )
+            (ok {
+                proposal-id: proposal-id,
+                total-votes: total-votes,
+                quorum-threshold: quorum,
+                participation-rate: (if (> quorum u0)
+                    (/ (* total-votes u100) quorum)
+                    u0
+                ),
+                quorum-met: (>= total-votes quorum)
+            })
+        )
+        (err ERR-PROPOSAL-NOT-FOUND)
+    )
+)
+
+(define-read-only (analyze-proposal-voting-pattern (proposal-id uint))
+    (match (map-get? proposals proposal-id)
+        proposal (let
+            (
+                (yes-votes (get yes-votes proposal))
+                (no-votes (get no-votes proposal))
+                (total-votes (+ yes-votes no-votes))
+            )
+            (ok {
+                proposal-id: proposal-id,
+                yes-votes: yes-votes,
+                no-votes: no-votes,
+                total-votes: total-votes,
+                yes-percentage: (if (> total-votes u0)
+                    (/ (* yes-votes u100) total-votes)
+                    u0
+                ),
+                no-percentage: (if (> total-votes u0)
+                    (/ (* no-votes u100) total-votes)
+                    u0
+                ),
+                margin: (if (> yes-votes no-votes)
+                    (- yes-votes no-votes)
+                    (- no-votes yes-votes)
+                ),
+                outcome: (get status proposal)
+            })
+        )
+        (err ERR-PROPOSAL-NOT-FOUND)
+    )
+)
+
+(define-read-only (get-active-proposals-count)
+    (let
+        (
+            (total-props (var-get proposal-count))
+            (active-count (fold count-active-proposals (list u1 u2 u3 u4 u5 u6 u7 u8 u9 u10) u0))
+        )
+        (ok active-count)
+    )
+)
+
+(define-private (count-active-proposals (proposal-id uint) (acc uint))
+    (match (map-get? proposals proposal-id)
+        proposal (if (is-eq (get status proposal) "active")
+            (+ acc u1)
+            acc
+        )
+        acc
+    )
+)
+
+(define-read-only (get-member-proposal-activity (member principal))
+    (let
+        (
+            (total-props (var-get proposal-count))
+            (created-count (fold count-member-proposals-for-user (list u1 u2 u3 u4 u5 u6 u7 u8 u9 u10) {target-member: member, count: u0}))
+        )
+        (ok {
+            member: member,
+            proposals-created: (get count created-count),
+            activity-level: (if (>= (get count created-count) u3)
+                "high"
+                (if (>= (get count created-count) u1)
+                    "medium"
+                    "low"
+                )
+            )
+        })
+    )
+)
+
+(define-private (count-member-proposals-for-user (proposal-id uint) (acc {target-member: principal, count: uint}))
+    (match (map-get? proposals proposal-id)
+        proposal (if (is-eq (get creator proposal) (get target-member acc))
+            {target-member: (get target-member acc), count: (+ (get count acc) u1)}
+            acc
+        )
+        acc
+    )
+)
+
+
+;; Proposal Search and Utility Functions
+(define-read-only (check-proposal-by-status (proposal-id uint) (target-status (string-ascii 20)))
+    (match (map-get? proposals proposal-id)
+        proposal (ok (is-eq (get status proposal) target-status))
+        (err ERR-PROPOSAL-NOT-FOUND)
+    )
+)
+
+(define-read-only (check-proposal-by-creator (proposal-id uint) (target-creator principal))
+    (match (map-get? proposals proposal-id)
+        proposal (ok (is-eq (get creator proposal) target-creator))
+        (err ERR-PROPOSAL-NOT-FOUND)
+    )
+)
+
+(define-read-only (check-proposal-voting-threshold (proposal-id uint) (min-votes uint))
+    (match (map-get? proposals proposal-id)
+        proposal (ok (>= (+ (get yes-votes proposal) (get no-votes proposal)) min-votes))
+        (err ERR-PROPOSAL-NOT-FOUND)
+    )
+)
+
+;; Governance Reputation System
+(define-read-only (calculate-member-reputation-score (member principal))
+    (let
+        (
+            (voting-weight (get-member-weight member))
+            (proposals-created (unwrap-panic (get-member-proposal-activity member)))
+            (member-proposal-count (get proposals-created proposals-created))
+            (voting-score (* voting-weight u2))
+            (creation-score (* member-proposal-count u10))
+            (participation-bonus (if (> voting-weight u0) u25 u0))
+        )
+        (ok (+ voting-score creation-score participation-bonus))
+    )
+)
+
+(define-read-only (get-member-governance-profile (member principal))
+    (let
+        (
+            (voting-stats (unwrap-panic (get-member-voting-stats member)))
+            (activity-stats (unwrap-panic (get-member-proposal-activity member)))
+            (reputation-score (unwrap-panic (calculate-member-reputation-score member)))
+        )
+        (ok {
+            member: member,
+            voting-weight: (get voting-weight voting-stats),
+            total-voting-power: (get total-voting-power voting-stats),
+            has-delegation: (get has-delegation voting-stats),
+            proposals-created: (get proposals-created activity-stats),
+            activity-level: (get activity-level activity-stats),
+            reputation-score: reputation-score,
+            governance-tier: (if (>= reputation-score u100)
+                "premium"
+                (if (>= reputation-score u50)
+                    "standard"
+                    "basic"
+                )
+            )
+        })
+    )
+)
+
+(define-read-only (analyze-dao-health)
+    (let
+        (
+            (governance-stats (unwrap-panic (get-governance-stats)))
+            (success-rate (unwrap-panic (get-proposal-success-rate)))
+            (active-proposals (unwrap-panic (get-active-proposals-count)))
+        )
+        (ok {
+            total-proposals: (get total-proposals governance-stats),
+            success-rate: success-rate,
+            active-proposals: active-proposals,
+            treasury-balance: (get treasury-balance governance-stats),
+            quorum-threshold: (get current-quorum-threshold governance-stats),
+            health-score: (+ 
+                (if (> success-rate u50) u30 u10)
+                (if (> active-proposals u0) u20 u5)
+                (if (> (get treasury-balance governance-stats) u1000000) u25 u10)
+                (if (<= (get current-quorum-threshold governance-stats) u1000) u25 u15)
+            ),
+            status: (if (> (+ 
+                (if (> success-rate u50) u30 u10)
+                (if (> active-proposals u0) u20 u5)
+                (if (> (get treasury-balance governance-stats) u1000000) u25 u10)
+                (if (<= (get current-quorum-threshold governance-stats) u1000) u25 u15)
+            ) u75)
+                "healthy"
+                (if (> (+ 
+                    (if (> success-rate u50) u30 u10)
+                    (if (> active-proposals u0) u20 u5)
+                    (if (> (get treasury-balance governance-stats) u1000000) u25 u10)
+                    (if (<= (get current-quorum-threshold governance-stats) u1000) u25 u15)
+                ) u50)
+                    "moderate"
+                    "needs-attention"
+                )
+            )
+        })
+    )
+)
