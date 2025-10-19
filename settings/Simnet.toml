@@ -1,6 +1,7 @@
 [network]
 name = "simnet"
-rpc_url = "http://localhost:20443"
+rpc_url = "http://localhost:20443
+"
 
 [accounts.deployer]
 mnemonic = "exotic lizard fence magic torch spirit eyebrow rail avocado blossom gift winter"
