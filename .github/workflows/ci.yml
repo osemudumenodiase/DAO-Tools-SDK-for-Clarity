@@ -14,4 +14,4 @@ jobs:
       - name: "Validate Clarinet contracts and deployment plan"  
         uses: docker://hirosystems/clarinet:latest  
         with:  
-          args: check --plan deployments/default.simnet-plan.yaml  
+          args: check --deployment-plan-path deployments/default.simnet-plan.yaml
