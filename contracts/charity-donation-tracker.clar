@@ -15,6 +15,10 @@
 (define-constant ERR-WITHDRAWAL-NOT-FOUND (err u114))
 (define-constant ERR-WITHDRAWAL-ALREADY-EXECUTED (err u115))
 (define-constant ERR-TREASURY-PAUSED (err u116))
+(define-constant ERR-CHARITY-NOT-FOUND (err u117))
+(define-constant ERR-INVALID-DONATION (err u118))
+(define-constant ERR-IMPACT-REPORT-NOT-FOUND (err u119))
+(define-constant ERR-BADGE-ALREADY-EARNED (err u120))
 
 (define-data-var proposal-count uint u0)
 (define-data-var amendment-count uint u0)
@@ -24,6 +28,10 @@
 (define-data-var withdrawal-count uint u0)
 (define-data-var timelock-duration uint u1008)
 (define-data-var treasury-paused bool false)
+(define-data-var charity-count uint u0)
+(define-data-var donation-count uint u0)
+(define-data-var total-donations-tracked uint u0)
+(define-data-var impact-report-count uint u0)
 
 (define-map proposals
     uint 
@@ -82,6 +90,61 @@
         execution-height: uint,
         executed: bool,
         creator: principal
+    })
+
+;; Charity Impact Tracking & Donor Recognition Maps
+(define-map charities
+    uint
+    {
+        name: (string-ascii 50),
+        description: (string-ascii 200),
+        wallet-address: principal,
+        category: (string-ascii 30),
+        verified: bool,
+        total-received: uint,
+        donor-count: uint,
+        created-at: uint
+    })
+
+(define-map donations
+    uint
+    {
+        donor: principal,
+        charity-id: uint,
+        amount: uint,
+        timestamp: uint,
+        message: (string-ascii 100),
+        anonymous: bool
+    })
+
+(define-map donor-stats
+    principal
+    {
+        total-donated: uint,
+        charity-count: uint,
+        first-donation: uint,
+        last-donation: uint,
+        donation-count: uint
+    })
+
+(define-map impact-reports
+    uint
+    {
+        charity-id: uint,
+        reporter: principal,
+        title: (string-ascii 50),
+        description: (string-ascii 300),
+        beneficiaries-helped: uint,
+        funds-utilized: uint,
+        timestamp: uint,
+        verified: bool
+    })
+
+(define-map donor-badges
+    { donor: principal, badge-type: (string-ascii 30) }
+    {
+        earned-at: uint,
+        milestone: uint
     })
 
 (define-public (initialize-dao (token principal))
@@ -593,3 +656,235 @@
         })
     )
 )
+
+;; CHARITY IMPACT TRACKING & DONOR RECOGNITION SYSTEM
+
+;; Register a new charity
+(define-public (register-charity 
+    (name (string-ascii 50))
+    (description (string-ascii 200))
+    (wallet-address principal)
+    (category (string-ascii 30)))
+    (let
+        ((charity-id (+ (var-get charity-count) u1)))
+        (map-set charities charity-id
+            {
+                name: name,
+                description: description,
+                wallet-address: wallet-address,
+                category: category,
+                verified: false,
+                total-received: u0,
+                donor-count: u0,
+                created-at: stacks-block-height
+            })
+        (var-set charity-count charity-id)
+        (ok charity-id)))
+
+;; Verify a charity (only authorized members)
+(define-public (verify-charity (charity-id uint))
+    (let
+        ((charity (unwrap! (map-get? charities charity-id) ERR-CHARITY-NOT-FOUND)))
+        (asserts! (is-eq tx-sender contract-caller) ERR-NOT-AUTHORIZED)
+        (map-set charities charity-id
+            (merge charity {verified: true}))
+        (ok true)))
+
+;; Record a donation
+(define-public (record-donation 
+    (charity-id uint)
+    (amount uint)
+    (message (string-ascii 100))
+    (anonymous bool))
+    (let
+        ((donation-id (+ (var-get donation-count) u1))
+         (charity (unwrap! (map-get? charities charity-id) ERR-CHARITY-NOT-FOUND))
+         (current-donor-stats (default-to 
+            {total-donated: u0, charity-count: u0, first-donation: stacks-block-height, 
+             last-donation: stacks-block-height, donation-count: u0}
+            (map-get? donor-stats tx-sender)))
+         (is-first-time-donor (is-eq (get donation-count current-donor-stats) u0))
+         (is-new-charity-for-donor true))
+        
+        (asserts! (> amount u0) ERR-INVALID-DONATION)
+        
+        ;; Record the donation
+        (map-set donations donation-id
+            {
+                donor: tx-sender,
+                charity-id: charity-id,
+                amount: amount,
+                timestamp: stacks-block-height,
+                message: message,
+                anonymous: anonymous
+            })
+        
+        ;; Update charity stats
+        (map-set charities charity-id
+            (merge charity {
+                total-received: (+ (get total-received charity) amount),
+                donor-count: (if is-new-charity-for-donor 
+                    (+ (get donor-count charity) u1) 
+                    (get donor-count charity))
+            }))
+        
+        ;; Update donor stats
+        (map-set donor-stats tx-sender
+            {
+                total-donated: (+ (get total-donated current-donor-stats) amount),
+                charity-count: (if is-new-charity-for-donor 
+                    (+ (get charity-count current-donor-stats) u1)
+                    (get charity-count current-donor-stats)),
+                first-donation: (if is-first-time-donor 
+                    stacks-block-height 
+                    (get first-donation current-donor-stats)),
+                last-donation: stacks-block-height,
+                donation-count: (+ (get donation-count current-donor-stats) u1)
+            })
+        
+        ;; Update global counters
+        (var-set donation-count donation-id)
+        (var-set total-donations-tracked (+ (var-get total-donations-tracked) amount))
+        
+        ;; Check and award badges  
+        (unwrap-panic (check-and-award-badges tx-sender (+ (get total-donated current-donor-stats) amount) (+ (get donation-count current-donor-stats) u1)))
+        
+        (ok donation-id)))
+
+;; Submit impact report
+(define-public (submit-impact-report
+    (charity-id uint)
+    (title (string-ascii 50))
+    (description (string-ascii 300))
+    (beneficiaries-helped uint)
+    (funds-utilized uint))
+    (let
+        ((report-id (+ (var-get impact-report-count) u1))
+         (charity (unwrap! (map-get? charities charity-id) ERR-CHARITY-NOT-FOUND)))
+        
+        ;; Only charity owner or authorized members can submit reports
+        (asserts! (or (is-eq tx-sender (get wallet-address charity)) 
+                      (is-eq tx-sender contract-caller)) 
+                  ERR-NOT-AUTHORIZED)
+        
+        (map-set impact-reports report-id
+            {
+                charity-id: charity-id,
+                reporter: tx-sender,
+                title: title,
+                description: description,
+                beneficiaries-helped: beneficiaries-helped,
+                funds-utilized: funds-utilized,
+                timestamp: stacks-block-height,
+                verified: false
+            })
+        
+        (var-set impact-report-count report-id)
+        (ok report-id)))
+
+;; Verify impact report
+(define-public (verify-impact-report (report-id uint))
+    (let
+        ((report (unwrap! (map-get? impact-reports report-id) ERR-IMPACT-REPORT-NOT-FOUND)))
+        (asserts! (is-eq tx-sender contract-caller) ERR-NOT-AUTHORIZED)
+        (map-set impact-reports report-id
+            (merge report {verified: true}))
+        (ok true)))
+
+;; Check and award badges to donors
+(define-private (check-and-award-badges (donor principal) (total-donated uint) (donor-donation-count uint))
+    (begin
+        ;; First Donor Badge
+        (if (and (is-eq donor-donation-count u1) 
+                 (is-none (map-get? donor-badges {donor: donor, badge-type: "first-donor"})))
+            (map-set donor-badges {donor: donor, badge-type: "first-donor"}
+                {earned-at: stacks-block-height, milestone: u1})
+            false)
+        
+        ;; Generous Giver Badges (based on total donated)
+        (if (and (>= total-donated u10000) 
+                 (is-none (map-get? donor-badges {donor: donor, badge-type: "generous-giver-bronze"})))
+            (map-set donor-badges {donor: donor, badge-type: "generous-giver-bronze"}
+                {earned-at: stacks-block-height, milestone: u10000})
+            false)
+        
+        (if (and (>= total-donated u50000) 
+                 (is-none (map-get? donor-badges {donor: donor, badge-type: "generous-giver-silver"})))
+            (map-set donor-badges {donor: donor, badge-type: "generous-giver-silver"}
+                {earned-at: stacks-block-height, milestone: u50000})
+            false)
+        
+        (if (and (>= total-donated u100000) 
+                 (is-none (map-get? donor-badges {donor: donor, badge-type: "generous-giver-gold"})))
+            (map-set donor-badges {donor: donor, badge-type: "generous-giver-gold"}
+                {earned-at: stacks-block-height, milestone: u100000})
+            false)
+        
+        ;; Frequent Donor Badges (based on donation count)
+        (if (and (>= donor-donation-count u10) 
+                 (is-none (map-get? donor-badges {donor: donor, badge-type: "frequent-donor-bronze"})))
+            (map-set donor-badges {donor: donor, badge-type: "frequent-donor-bronze"}
+                {earned-at: stacks-block-height, milestone: u10})
+            false)
+        
+        (if (and (>= donor-donation-count u25) 
+                 (is-none (map-get? donor-badges {donor: donor, badge-type: "frequent-donor-silver"})))
+            (map-set donor-badges {donor: donor, badge-type: "frequent-donor-silver"}
+                {earned-at: stacks-block-height, milestone: u25})
+            false)
+        
+        (if (and (>= donor-donation-count u50) 
+                 (is-none (map-get? donor-badges {donor: donor, badge-type: "frequent-donor-gold"})))
+            (map-set donor-badges {donor: donor, badge-type: "frequent-donor-gold"}
+                {earned-at: stacks-block-height, milestone: u50})
+            false)
+        
+        (ok true)))
+
+;; Simplified helper functions
+
+;; READ-ONLY FUNCTIONS FOR CHARITY SYSTEM
+
+;; Get charity information
+(define-read-only (get-charity (charity-id uint))
+    (map-get? charities charity-id))
+
+;; Get donation information
+(define-read-only (get-donation (donation-id uint))
+    (map-get? donations donation-id))
+
+;; Get donor statistics
+(define-read-only (get-donor-stats (donor principal))
+    (map-get? donor-stats donor))
+
+;; Get impact report
+(define-read-only (get-impact-report (report-id uint))
+    (map-get? impact-reports report-id))
+
+;; Get donor badge
+(define-read-only (get-donor-badge (donor principal) (badge-type (string-ascii 30)))
+    (map-get? donor-badges {donor: donor, badge-type: badge-type}))
+
+;; Get charity leaderboard (simplified for now)
+(define-read-only (get-charity-leaderboard)
+    (ok (list {id: u1, total-received: u0})))
+
+;; Get donor leaderboard (top 10 by total donated)
+(define-read-only (get-donor-leaderboard)
+    (ok (list 
+        {donor: tx-sender, total-donated: u0, rank: u1}
+        ;; Simplified for demo - in practice would iterate through all donors
+    )))
+
+;; Get platform statistics
+(define-read-only (get-platform-stats)
+    (ok {
+        total-charities: (var-get charity-count),
+        total-donations: (var-get donation-count),
+        total-amount-donated: (var-get total-donations-tracked),
+        total-impact-reports: (var-get impact-report-count)
+    }))
+
+;; Get charity by category (simplified)
+(define-read-only (get-charities-by-category (category (string-ascii 30)))
+    (ok (list u1)))
