@@ -60,8 +60,8 @@ plan:
     - id: 0
       transactions:
         - emulated-contract-publish:
-            contract-name: charity-donation-tracker
+            contract-name: simple-dao
             emulated-sender: ST1PQHQKV0RJXZFY1DGX8MNSNYVE3VGZJSRTPGZGM
-            path: "contracts/charity-donation-tracker.clar"
+            path: "contracts/simple-dao.clar"
             clarity-version: 3
       epoch: "3.1"

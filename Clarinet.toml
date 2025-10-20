@@ -5,8 +5,8 @@ authors = []
 telemetry = true
 cache_dir = '.\.cache'
 requirements = []
-[contracts.charity-donation-tracker]
-path = 'contracts/charity-donation-tracker.clar'
+[contracts.simple-dao]
+path = 'contracts/simple-dao.clar'
 clarity_version = 3
 epoch = 3.1
 [repl.analysis]
