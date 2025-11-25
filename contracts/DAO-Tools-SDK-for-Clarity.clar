@@ -1,4 +1,4 @@
-﻿(define-constant ERR-NOT-AUTHORIZED (err u100))
+(define-constant ERR-NOT-AUTHORIZED (err u100))
 (define-constant ERR-INVALID-PROPOSAL (err u101))
 (define-constant ERR-PROPOSAL-EXPIRED (err u102))
 (define-constant ERR-ALREADY-VOTED (err u103))
@@ -15,10 +15,7 @@
 (define-constant ERR-WITHDRAWAL-NOT-FOUND (err u114))
 (define-constant ERR-WITHDRAWAL-ALREADY-EXECUTED (err u115))
 (define-constant ERR-TREASURY-PAUSED (err u116))
-(define-constant ERR-EXECUTION-FAILED (err u117))
-(define-constant ERR-ALREADY-EXECUTED (err u118))
-(define-constant ERR-EXECUTION-NOT-FOUND (err u119))
-(define-constant ERR-INSUFFICIENT-SIGNATURES (err u120))
+(define-constant ERR-SNAPSHOT-NOT-FOUND (err u117))
 
 (define-data-var proposal-count uint u0)
 (define-data-var amendment-count uint u0)
@@ -28,8 +25,6 @@
 (define-data-var withdrawal-count uint u0)
 (define-data-var timelock-duration uint u1008)
 (define-data-var treasury-paused bool false)
-(define-data-var execution-count uint u0)
-(define-data-var min-signatures-required uint u3)
 
 (define-map proposals
     uint 
@@ -42,7 +37,8 @@
         yes-votes: uint,
         no-votes: uint,
         status: (string-ascii 20),
-        execution-params: (list 10 principal)
+        execution-params: (list 10 principal),
+        snapshot-height: uint
     }
 )
 
@@ -90,22 +86,13 @@
         creator: principal
     })
 
-(define-map proposal-executions
-    uint
-    {
-        proposal-id: uint,
-        target-contract: principal,
-        function-name: (string-ascii 50),
-        parameters: (list 10 (buff 34)),
-        executed: bool,
-        execution-height: uint,
-        signatures: (list 10 principal),
-        signature-count: uint
-    })
+(define-map voting-power-snapshots
+    { proposal-id: uint, member: principal }
+    { power: uint })
 
-(define-map execution-signatures
-    { execution-id: uint, signer: principal }
-    { signed: bool, signature-height: uint })
+(define-map weight-history
+    { member: principal, height: uint }
+    { weight: uint })
 
 (define-public (initialize-dao (token principal))
     (begin
@@ -132,7 +119,8 @@
                 yes-votes: u0,
                 no-votes: u0,
                 status: "active",
-                execution-params: execution-params
+                execution-params: execution-params,
+                snapshot-height: stacks-block-height
             })
         (var-set proposal-count proposal-id)
         (ok proposal-id)))
@@ -140,10 +128,30 @@
 (define-read-only (get-total-voting-power (member principal))
     (+ (default-to u0 (map-get? member-weights member)) u0))
 
+(define-read-only (get-voting-power-at-snapshot (proposal-id uint) (member principal))
+    (let
+        ((proposal (unwrap! (map-get? proposals proposal-id) ERR-PROPOSAL-NOT-FOUND))
+         (snapshot-height (get snapshot-height proposal)))
+        (ok (default-to 
+            (get-total-voting-power member)
+            (match (map-get? voting-power-snapshots { proposal-id: proposal-id, member: member })
+                snapshot-data (some (get power snapshot-data))
+                none)))))
+
+(define-public (record-voting-power-snapshot (proposal-id uint))
+    (let
+        ((proposal (unwrap! (map-get? proposals proposal-id) ERR-PROPOSAL-NOT-FOUND))
+         (current-power (get-total-voting-power tx-sender)))
+        (asserts! (is-eq (get status proposal) "active") ERR-PROPOSAL-NOT-ACTIVE)
+        (map-set voting-power-snapshots 
+            { proposal-id: proposal-id, member: tx-sender }
+            { power: current-power })
+        (ok current-power)))
+
 (define-public (cast-vote (proposal-id uint) (vote bool))
     (let
         ((proposal (unwrap! (map-get? proposals proposal-id) ERR-PROPOSAL-NOT-FOUND))
-         (voter-weight (get-total-voting-power tx-sender)))
+         (voter-weight (unwrap! (get-voting-power-at-snapshot proposal-id tx-sender) ERR-SNAPSHOT-NOT-FOUND)))
         (asserts! (is-eq (get status proposal) "active") ERR-PROPOSAL-NOT-ACTIVE)
         (asserts! (>= stacks-block-height (get start-height proposal)) ERR-INVALID-PROPOSAL)
         (asserts! (<= stacks-block-height (get end-height proposal)) ERR-PROPOSAL-EXPIRED)
@@ -170,87 +178,13 @@
                     "rejected")}))
         (ok true)))
 
-(define-public (create-execution-proposal
-    (proposal-id uint)
-    (target-contract principal)
-    (function-name (string-ascii 50))
-    (parameters (list 10 (buff 34))))
-    (let
-        ((proposal (unwrap! (map-get? proposals proposal-id) ERR-PROPOSAL-NOT-FOUND))
-         (execution-id (+ (var-get execution-count) u1)))
-        (asserts! (is-eq (get status proposal) "passed") ERR-PROPOSAL-NOT-ACTIVE)
-        (asserts! (> (get-total-voting-power tx-sender) u0) ERR-NOT-AUTHORIZED)
-        (map-set proposal-executions execution-id
-            {
-                proposal-id: proposal-id,
-                target-contract: target-contract,
-                function-name: function-name,
-                parameters: parameters,
-                executed: false,
-                execution-height: u0,
-                signatures: (list),
-                signature-count: u0
-            })
-        (var-set execution-count execution-id)
-        (ok execution-id)))
-
-(define-public (sign-execution (execution-id uint))
-    (let
-        ((execution (unwrap! (map-get? proposal-executions execution-id) ERR-EXECUTION-NOT-FOUND))
-         (current-signatures (get signature-count execution)))
-        (asserts! (> (get-total-voting-power tx-sender) u0) ERR-NOT-AUTHORIZED)
-        (asserts! (not (get executed execution)) ERR-ALREADY-EXECUTED)
-        (asserts! (is-none (map-get? execution-signatures {execution-id: execution-id, signer: tx-sender})) ERR-ALREADY-VOTED)
-        (map-set execution-signatures {execution-id: execution-id, signer: tx-sender} 
-            {signed: true, signature-height: stacks-block-height})
-        (map-set proposal-executions execution-id
-            (merge execution {
-                signatures: (unwrap! (as-max-len? (append (get signatures execution) tx-sender) u10) ERR-EXECUTION-FAILED),
-                signature-count: (+ current-signatures u1)
-            }))
-        (ok true)))
-
-(define-public (execute-proposal (execution-id uint))
-    (let
-        ((execution (unwrap! (map-get? proposal-executions execution-id) ERR-EXECUTION-NOT-FOUND)))
-        (asserts! (not (get executed execution)) ERR-ALREADY-EXECUTED)
-        (asserts! (>= (get signature-count execution) (var-get min-signatures-required)) ERR-INSUFFICIENT-SIGNATURES)
-        (map-set proposal-executions execution-id
-            (merge execution {
-                executed: true,
-                execution-height: stacks-block-height
-            }))
-        (ok true)))
-
-(define-public (set-min-signatures (new-min uint))
-    (begin
-        (asserts! (is-eq tx-sender contract-caller) ERR-NOT-AUTHORIZED)
-        (var-set min-signatures-required new-min)
-        (ok true)))
-
-(define-read-only (get-execution (execution-id uint))
-    (map-get? proposal-executions execution-id))
-
-(define-read-only (get-execution-signature (execution-id uint) (signer principal))
-    (map-get? execution-signatures {execution-id: execution-id, signer: signer}))
-
-(define-read-only (get-total-executions)
-    (var-get execution-count))
-
-(define-read-only (get-min-signatures-required)
-    (var-get min-signatures-required))
-
-(define-read-only (can-execute (execution-id uint))
-    (match (map-get? proposal-executions execution-id)
-        execution (ok (and
-            (not (get executed execution))
-            (>= (get signature-count execution) (var-get min-signatures-required))))
-        ERR-EXECUTION-NOT-FOUND))
-
 (define-public (set-member-weight (member principal) (weight uint))
     (begin
         (asserts! (is-eq tx-sender contract-caller) ERR-NOT-AUTHORIZED)
         (map-set member-weights member weight)
+        (map-set weight-history 
+            { member: member, height: stacks-block-height }
+            { weight: weight })
         (ok true)))
 
 (define-public (delegate-to (delegate principal))
@@ -367,7 +301,7 @@
         ((withdrawal-id (+ (var-get withdrawal-count) u1))
          (execution-height (+ stacks-block-height (var-get timelock-duration))))
         (asserts! (not (var-get treasury-paused)) ERR-TREASURY-PAUSED)
-        (asserts! (<= amount (as-contract (stx-get-balance tx-sender))) ERR-TREASURY-INSUFFICIENT-BALANCE)
+(asserts! (<= amount (as-contract (stx-get-balance tx-sender))) ERR-TREASURY-INSUFFICIENT-BALANCE)
         (asserts! (> (get-total-voting-power tx-sender) u0) ERR-NOT-AUTHORIZED)
         (map-set treasury-withdrawals withdrawal-id
             {
@@ -387,7 +321,7 @@
         (asserts! (not (var-get treasury-paused)) ERR-TREASURY-PAUSED)
         (asserts! (not (get executed withdrawal)) ERR-WITHDRAWAL-ALREADY-EXECUTED)
         (asserts! (>= stacks-block-height (get execution-height withdrawal)) ERR-TIMELOCK-NOT-EXPIRED)
-        (asserts! (<= (get amount withdrawal) (as-contract (stx-get-balance tx-sender))) ERR-TREASURY-INSUFFICIENT-BALANCE)
+(asserts! (<= (get amount withdrawal) (as-contract (stx-get-balance tx-sender))) ERR-TREASURY-INSUFFICIENT-BALANCE)
         (try! (as-contract (stx-transfer? (get amount withdrawal) tx-sender (get recipient withdrawal))))
         (map-set treasury-withdrawals withdrawal-id
             (merge withdrawal {executed: true}))
@@ -425,3 +359,9 @@
 
 (define-read-only (get-total-withdrawals)
     (var-get withdrawal-count))
+
+(define-read-only (get-snapshot-power (proposal-id uint) (member principal))
+    (map-get? voting-power-snapshots { proposal-id: proposal-id, member: member }))
+
+(define-read-only (get-weight-at-height (member principal) (height uint))
+    (map-get? weight-history { member: member, height: height }))
